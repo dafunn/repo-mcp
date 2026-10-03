@@ -1,0 +1,19 @@
+[project]
+name = "repo-mcp"
+version = "0.1.0"
+description = "Read-only cross-repository git research MCP server"
+requires-python = ">=3.14"
+license = "MIT"
+dependencies = [
+    # The server uses the mcp 2.x API.
+    "mcp[cli]>=2,<3",
+    "httpx",
+    "starlette",
+    "uvicorn",
+]
+
+[project.optional-dependencies]
+# Test dependencies.
+dev = [
+    "pytest",
+]
