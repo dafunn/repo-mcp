@@ -5,8 +5,11 @@ a cache of repositories cloned from a git host, refreshed by a background fetch
 loop and by the `repo_refresh` tool. Repos are identified as ``owner/name``.
 
 The only git writes are clone and fetch into the cache, and the git token must be
-read-only. Every repo under the configured git owners is cloned except those in
-REPO_DENYLIST.
+read-only. Scope is one of two modes. With REPO_ALLOWLIST set, only the named
+``owner/name`` repos are cloned, fetched and readable; no owner listing is made, and
+repos already in the cache volume but not named are hidden. Otherwise every repo under
+GIT_OWNERS is cloned. REPO_DENYLIST excludes repos in either mode and wins over the
+allowlist.
 """
 
 from __future__ import annotations
@@ -45,13 +48,49 @@ CACHE_DIR = Path(os.getenv("REPO_CACHE_DIR", "/cache"))
 GIT_BASE_URL = _require_env(
     "GIT_BASE_URL", "the base URL of the git host to clone from, e.g. https://git.example.com"
 ).rstrip("/")
-GIT_OWNERS = [
-    o.strip()
-    for o in _require_env(
-        "GIT_OWNERS", "comma-separated owners/orgs to enumerate, e.g. example-org"
-    ).split(",")
-    if o.strip()
-]
+
+
+def _parse_allowlist(raw: str) -> tuple[str, ...]:
+    """Parse REPO_ALLOWLIST into unique ``owner/name`` entries, in order.
+
+    Raises naming the variable and the bad entry. Duplicates that differ only in case
+    collapse, since the forge treats them as one repo. A value with content but no
+    entries (e.g. ",") is an error: treating it as unset would drop the scoping the
+    operator asked for.
+    """
+    entries: list[str] = []
+    seen: set[str] = set()
+    for e in (x.strip() for x in raw.split(",")):
+        if not e:
+            continue
+        parts = e.split("/")
+        if len(parts) != 2 or not all(parts) or ".." in parts:
+            raise RuntimeError(f"REPO_ALLOWLIST entry '{e}' is invalid - expected 'owner/name'")
+        if e.casefold() not in seen:
+            seen.add(e.casefold())
+            entries.append(e)
+    if raw.strip() and not entries:
+        raise RuntimeError(f"REPO_ALLOWLIST '{raw.strip()}' has no entries - expected 'owner/name,...'")
+    return tuple(entries)
+
+
+REPO_ALLOWLIST = _parse_allowlist(os.getenv("REPO_ALLOWLIST", ""))
+if REPO_ALLOWLIST:
+    # One scoping source only, so it is never ambiguous which one applies.
+    if os.getenv("GIT_OWNERS", "").strip():
+        raise RuntimeError(
+            "REPO_ALLOWLIST and GIT_OWNERS are both set - set only one to scope the server"
+        )
+    GIT_OWNERS: list[str] = []
+else:
+    GIT_OWNERS = [
+        o.strip()
+        for o in _require_env(
+            "GIT_OWNERS",
+            "comma-separated owners/orgs to enumerate, e.g. example-org (or set REPO_ALLOWLIST)",
+        ).split(",")
+        if o.strip()
+    ]
 _denylist_raw = os.getenv("REPO_DENYLIST", "").strip()
 REPO_DENYLIST = frozenset(r.strip() for r in _denylist_raw.split(",") if r.strip())
 REFRESH_INTERVAL = int(os.getenv("REFRESH_INTERVAL_SECONDS", "900"))
@@ -84,7 +123,18 @@ def _repo_dir(repo: str) -> Path:
 
 def _is_denied(repo: str) -> bool:
     _owner, _, name = repo.partition("/")
-    return repo in REPO_DENYLIST or name in REPO_DENYLIST
+    # Case-folded: the forge treats owner/name case-insensitively, so an exact match
+    # would let a differently-cased entry through.
+    return any(d.casefold() in (repo.casefold(), name.casefold()) for d in REPO_DENYLIST)
+
+
+def _in_scope(repo: str) -> bool:
+    """True if the cache may expose ``repo``. Without an allowlist the cache is not
+    filtered (the denylist then only limits discovery)."""
+    if not REPO_ALLOWLIST:
+        return True
+    allowed = {e.casefold() for e in REPO_ALLOWLIST}
+    return repo.casefold() in allowed and not _is_denied(repo)
 
 
 def _validate_repo(repo: str) -> Path:
@@ -92,7 +142,9 @@ def _validate_repo(repo: str) -> Path:
     if not repo or repo.count("/") != 1 or ".." in repo.split("/"):
         raise ValueError(f"invalid repo id '{repo}' (expected 'owner/name')")
     d = _repo_dir(repo)
-    if not (d / ".git").is_dir():
+    # Out-of-scope repos get the not-in-cache message so the server does not confirm
+    # what else exists on the volume.
+    if not _in_scope(repo) or not (d / ".git").is_dir():
         raise ValueError(f"repo '{repo}' is not in the cache (try repo_list)")
     return d
 
@@ -103,7 +155,7 @@ def _cached_repos() -> list[str]:
     return sorted(
         f"{p.parent.name}/{p.name}"
         for p in CACHE_DIR.glob("*/*")
-        if (p / ".git").is_dir()
+        if (p / ".git").is_dir() and _in_scope(f"{p.parent.name}/{p.name}")
     )
 
 
@@ -175,12 +227,39 @@ async def _ensure_origin(d: Path, repo: str) -> None:
 
 
 # -- git discovery + cache lifecycle ----------------------------------
+async def _discover_allowlist(cli: httpx.AsyncClient) -> list[dict]:
+    """Look up each allowlisted repo by name; never lists an owner, so names of other
+    repos are not fetched. A repo the token cannot see is skipped."""
+    repos: list[dict] = []
+    for entry in REPO_ALLOWLIST:
+        if _is_denied(entry):
+            continue
+        owner, name = entry.split("/")
+        r = await cli.get(f"/api/v1/repos/{owner}/{name}")
+        # A 3xx is a renamed or transferred repo: httpx does not follow it, and failing
+        # the attempt would retry the same stale entry forever and block the rest.
+        if r.status_code in (403, 404) or 300 <= r.status_code < 400:
+            print(f"[repo-mcp] {entry}: not available at this path ({r.status_code}); skipped", flush=True)
+            continue
+        r.raise_for_status()
+        it = r.json()
+        # The forge's canonical name decides the cache path, whatever case the entry has.
+        full = it.get("full_name") or entry
+        if _is_denied(full):
+            continue
+        repos.append({"repo": full, "clone_url": it.get("clone_url") or f"{GIT_BASE_URL}/{full}.git"})
+    return repos
+
+
 async def _discover() -> list[dict]:
-    """[{repo:'owner/name', clone_url:...}] for all owners, minus the denylist."""
+    """[{repo:'owner/name', clone_url:...}] for the allowlist, or for all owners minus
+    the denylist."""
     repos: list[dict] = []
     tok = _token()
     headers = {"Authorization": f"token {tok}"} if tok else {}
     async with httpx.AsyncClient(base_url=GIT_BASE_URL, headers=headers, timeout=30) as cli:
+        if REPO_ALLOWLIST:
+            return await _discover_allowlist(cli)
         for owner in GIT_OWNERS:
             page = 1
             while True:
@@ -237,12 +316,13 @@ async def _discover_with_retry(attempts: int = 8, base_delay: float = 2.0) -> "l
 
 
 async def bootstrap() -> None:
-    """Discover org repos and clone any that are missing (denylist-excluded)."""
+    """Discover in-scope repos and clone any that are missing."""
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     repos = await _discover_with_retry()
     if repos is None:
         return
-    print(f"[repo-mcp] discovered {len(repos)} repos (owners={GIT_OWNERS}); cloning missing...", flush=True)
+    scope = f"allowlist ({len(REPO_ALLOWLIST)} repos)" if REPO_ALLOWLIST else f"owners={GIT_OWNERS}"
+    print(f"[repo-mcp] discovered {len(repos)} repos ({scope}); cloning missing...", flush=True)
     sem = asyncio.Semaphore(CLONE_CONCURRENCY)
     await asyncio.gather(*(_clone_missing(i, sem) for i in repos))
     print(f"[repo-mcp] bootstrap done; {len(_cached_repos())} repos in cache", flush=True)
