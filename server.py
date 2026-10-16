@@ -109,6 +109,15 @@ def _token() -> str:
     return os.getenv("GIT_TOKEN", "").strip()
 
 
+# -- Error results ----------------------------------------------------
+
+
+class ErrorText(str):
+    """A tool result that reports a failure. call_tool sends it with isError set,
+    so a client can tell it from output (a file or a grep match can itself
+    start with "Error:")."""
+
+
 # -- git + cache plumbing ---------------------------------------------
 _locks: dict[str, asyncio.Lock] = {}
 
@@ -402,7 +411,7 @@ async def _h_repo_tree(repo: str, path: str = "", depth: int = 0) -> str:
         args += ["--", path]
     rc, out, err = await _git(d, *args)
     if rc != 0:
-        return f"Error: {err.strip()}"
+        return ErrorText(f"Error: {err.strip()}")
     files = [f for f in out.splitlines() if f]
     if depth and depth > 0:
         prefix = path.rstrip("/") + "/" if path else ""
@@ -423,7 +432,7 @@ async def _h_repo_glob(repo: str, pattern: str) -> str:
             if p.is_file() and not (rel := str(p.resolve().relative_to(root))).startswith(".git/")
         )
     except Exception as exc:  # noqa: BLE001
-        return f"Error: bad glob: {exc}"
+        return ErrorText(f"Error: bad glob: {exc}")
     truncated = len(matches) > MAX_TREE_ENTRIES
     body = "\n".join(matches[:MAX_TREE_ENTRIES]) or "(no matches)"
     if truncated:
@@ -441,7 +450,7 @@ async def _h_repo_grep(repo: str, pattern: str, path: str = "", ignore_case: boo
         args += ["--", path]
     rc, out, err = await _git(d, *args)
     if rc not in (0, 1):  # 1 = no matches (not an error)
-        return f"Error: {err.strip()}"
+        return ErrorText(f"Error: {err.strip()}")
     lines = out.splitlines()
     if not lines:
         return "(no matches)"
@@ -470,7 +479,7 @@ async def _h_repo_read_file(repo: str, path: str, start_line: int = 0, end_line:
     try:
         target = _resolve_file(repo, path)
     except ValueError as exc:
-        return f"Error: {exc}"
+        return ErrorText(f"Error: {exc}")
     text = target.read_bytes()[:MAX_FILE_BYTES].decode("utf-8", "replace")
     if start_line or end_line:
         lines = text.splitlines()
@@ -489,10 +498,10 @@ async def _h_repo_read_file_base64(repo: str, path: str) -> str:
     try:
         target = _resolve_file(repo, path)
     except ValueError as exc:
-        return f"Error: {exc}"
+        return ErrorText(f"Error: {exc}")
     size = target.stat().st_size
     if size > MAX_FILE_BYTES:
-        return f"Error: '{path}' is {size} bytes, over MAX_FILE_BYTES ({MAX_FILE_BYTES})"
+        return ErrorText(f"Error: '{path}' is {size} bytes, over MAX_FILE_BYTES ({MAX_FILE_BYTES})")
     return base64.b64encode(target.read_bytes()).decode("ascii") or "(empty)"
 
 
@@ -502,7 +511,9 @@ async def _h_repo_log(repo: str, path: str = "", limit: int = 20) -> str:
     if path:
         args += ["--", path]
     rc, out, err = await _git(d, *args)
-    return out.strip() or "(no history)" if rc == 0 else f"Error: {err.strip()}"
+    if rc != 0:
+        return ErrorText(f"Error: {err.strip()}")
+    return out.strip() or "(no history)"
 
 
 async def _h_repo_diff(repo: str, base: str, head: str, path: str = "") -> str:
@@ -514,10 +525,10 @@ async def _h_repo_diff(repo: str, base: str, head: str, path: str = "") -> str:
         pargs += ["--", path]
     rc1, stat, e1 = await _git(d, *sargs)
     if rc1 != 0:
-        return f"Error: {e1.strip()} (did you repo_refresh to fetch both refs?)"
+        return ErrorText(f"Error: {e1.strip()} (did you repo_refresh to fetch both refs?)")
     rc2, patch, _e2 = await _git(d, *pargs)
     if rc2 != 0:
-        return f"Error: {_e2.strip()}"
+        return ErrorText(f"Error: {_e2.strip()}")
     if len(patch) > MAX_DIFF_BYTES:
         patch = patch[:MAX_DIFF_BYTES] + "\n... (diff truncated)"
     return f"=== diffstat {spec} ===\n{stat.strip()}\n\n=== patch ===\n{patch}"
@@ -545,7 +556,13 @@ async def _h_repo_refresh(repo: str = "") -> str:
 
 
 # -- MCP server wiring ------------------------------------------------
-_server = Server("repo-mcp")
+def release_version() -> str:
+    """The release this build reports to clients: REPO_MCP_VERSION,
+    stamped into the image from the repo-mcp-v* tag at build time, else `dev`."""
+    return os.environ.get("REPO_MCP_VERSION", "").strip() or "dev"
+
+
+_server = Server("repo-mcp", version=release_version())
 
 _TOOLS: list[Tool] = [
     Tool(name="repo_list",
@@ -617,8 +634,9 @@ async def call_tool(_ctx: Any, params: CallToolRequestParams) -> CallToolResult:
     try:
         result = await _dispatch(params.name, params.arguments or {})
     except Exception as exc:  # noqa: BLE001 - surface as a tool error, don't crash the server
-        result = f"Error: {exc}"
-    return CallToolResult(content=[TextContent(type="text", text=result)])
+        result = ErrorText(f"Error: {exc}")
+    return CallToolResult(content=[TextContent(type="text", text=result)],
+                          is_error=isinstance(result, ErrorText))
 
 # Each handler is registered with its wire method and params model; the runner
 # validates a request against the model before calling the handler.
@@ -645,7 +663,7 @@ async def _dispatch(name: str, a: dict) -> str:
         return await _h_repo_diff(a["repo"], a["base"], a["head"], a.get("path", ""))
     if name == "repo_refresh":
         return await _h_repo_refresh(a.get("repo", ""))
-    return f"Error: unknown tool '{name}'"
+    return ErrorText(f"Error: unknown tool '{name}'")
 
 
 # -- Entry point ------------------------------------------------------

@@ -51,3 +51,12 @@ uv sync --frozen               # Python 3.14 and uv
 MCP_TRANSPORT=sse REPO_CACHE_DIR=/tmp/cache GIT_TOKEN=... .venv/bin/python server.py
 ```
 Tests: `uv sync --frozen --extra dev && .venv/bin/python -m pytest tests/` (needs `git`).
+
+The server reports its release in the MCP `initialize` result
+(`serverInfo.version`). To stamp it, build from a checkout with tags:
+
+```
+docker build --build-arg REPO_MCP_VERSION=$(git describe --tags --match 'repo-mcp-v*' | sed 's/^repo-mcp-v//') .
+```
+
+A build without it reports `dev`.

@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from mcp.types import CallToolRequestParams
 
 _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
@@ -201,3 +202,61 @@ def test_build_sse_app_constructs():
     from starlette.applications import Starlette
     assert isinstance(app, Starlette)
     assert "/sse" in {getattr(r, "path", None) for r in app.routes}
+
+
+# -- error results carry isError ---------------------------------------------
+
+
+def _call(name: str, args: dict):
+    return _run(srv.call_tool(None, CallToolRequestParams(name=name, arguments=args)))
+
+
+@pytest.mark.parametrize("name, args, text", [
+    ("repo_tree", {"repo": "me/nope"}, "Error: repo 'me/nope' is not in the cache (try repo_list)"),
+    ("repo_grep", {"repo": "../etc", "pattern": "x"},
+     "Error: invalid repo id '../etc' (expected 'owner/name')"),
+    ("repo_read_file", {"repo": "me/proj", "path": "../../etc/passwd"},
+     "Error: path escapes repository root"),
+    ("repo_read_file", {"repo": "me/proj", "path": "missing.py"}, "Error: not a file: missing.py"),
+    ("repo_diff", {"repo": "me/proj", "base": "nope-a", "head": "nope-b"}, None),
+    ("repo_log", {"repo": "me/proj", "path": "", "limit": "x"}, None),
+    ("nope", {}, "Error: unknown tool 'nope'"),
+])
+def test_refusals_and_failures_are_error_results(cache, name, args, text):
+    result = _call(name, args)
+    assert result.is_error is True
+    assert result.content[0].text.startswith("Error: ")
+    if text is not None:
+        assert result.content[0].text == text
+
+
+def test_a_file_reading_like_an_error_is_not_an_error(cache):
+    repo = cache / "me" / "proj"
+    (repo / "notes.txt").write_text("Error: this is just text\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "notes")
+    result = _call("repo_read_file", {"repo": "me/proj", "path": "notes.txt"})
+    assert not result.is_error
+    assert "Error: this is just text" in result.content[0].text
+
+
+# -- Release version ------------------------------------------------
+
+
+def test_release_version_is_dev_when_unset(monkeypatch):
+    monkeypatch.delenv("REPO_MCP_VERSION", raising=False)
+    assert srv.release_version() == "dev"
+
+
+def test_release_version_is_dev_when_blank(monkeypatch):
+    monkeypatch.setenv("REPO_MCP_VERSION", "  ")
+    assert srv.release_version() == "dev"
+
+
+def test_release_version_reports_the_build_value(monkeypatch):
+    monkeypatch.setenv("REPO_MCP_VERSION", "0.2.0-3-gabc1234")
+    assert srv.release_version() == "0.2.0-3-gabc1234"
+
+
+def test_server_reports_the_release_version():
+    assert srv._server.version == srv.release_version()
