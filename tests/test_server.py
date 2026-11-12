@@ -193,15 +193,73 @@ def test_discover_with_retry_gives_up(monkeypatch):
     assert _run(srv._discover_with_retry(attempts=3, base_delay=0)) is None
 
 
-def test_build_sse_app_constructs():
-    # Builds the SSE app, which the handler tests never touch. Skipped when
-    # starlette is not installed.
-    pytest.importorskip("starlette")
-    pytest.importorskip("mcp.server.sse")
-    app = srv.build_sse_app()
-    from starlette.applications import Starlette
-    assert isinstance(app, Starlette)
-    assert "/sse" in {getattr(r, "path", None) for r in app.routes}
+# -- streamable HTTP transport -----------------------------------------------
+
+
+@pytest.fixture
+def http_app(monkeypatch):
+    """The HTTP app with the cache bootstrap stubbed out, so its lifespan makes no
+    network calls."""
+    async def no_bootstrap():
+        return None
+
+    monkeypatch.setattr(srv, "_bootstrap_then_loop", no_bootstrap)
+    return srv.build_http_app()
+
+
+def _http(app, method, path, headers=None, json=None):
+    """One request to `app` in-process, with its lifespan (the session manager) running."""
+    import httpx2
+
+    async def _call():
+        async with app.router.lifespan_context(app):
+            async with httpx2.AsyncClient(
+                transport=httpx2.ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                return await client.request(method, path, headers=headers or {}, json=json)
+
+    return _run(_call())
+
+
+def _mcp_request(app, method, params=None):
+    """POST one 2026-07-28 request: self-contained, no initialize and no session.
+    The method, and for tools/call the tool name, are repeated in headers."""
+    meta = {
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientInfo": {"name": "test", "version": "0"},
+        "io.modelcontextprotocol/clientCapabilities": {},
+    }
+    headers = {
+        "Accept": "application/json, text/event-stream",
+        "MCP-Protocol-Version": "2026-07-28",
+        "Mcp-Method": method,
+    }
+    if params and "name" in params:
+        headers["Mcp-Name"] = params["name"]
+    return _http(
+        app, "POST", "/mcp",
+        headers=headers,
+        json={"jsonrpc": "2.0", "id": 1, "method": method,
+              "params": {**(params or {}), "_meta": meta}},
+    )
+
+
+def test_http_app_serves_tools_list_at_mcp(http_app):
+    resp = _mcp_request(http_app, "tools/list")
+    assert resp.status_code == 200
+    assert "repo_list" in {t["name"] for t in resp.json()["result"]["tools"]}
+
+
+def test_http_app_marks_an_error_result(http_app):
+    resp = _mcp_request(http_app, "tools/call", {"name": "nope", "arguments": {}})
+    result = resp.json()["result"]
+    assert result["isError"] is True
+    assert result["content"][0]["text"] == "Error: unknown tool 'nope'"
+
+
+def test_http_app_answers_healthz(http_app):
+    resp = _http(http_app, "GET", "/healthz")
+    assert resp.status_code == 200 and resp.text == "ok"
 
 
 # -- error results carry isError ---------------------------------------------

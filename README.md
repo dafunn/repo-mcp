@@ -28,8 +28,8 @@ holds them. Use the allowlist where only named repos should be reachable.
 ## Config (env)
 | var | default | meaning |
 | --- | --- | --- |
-| `MCP_TRANSPORT` | `stdio` | set `sse` in-cluster |
-| `MCP_HOST` / `MCP_PORT` | `0.0.0.0` / `3000` | SSE bind |
+| `MCP_TRANSPORT` | `stdio` | set `streamable-http` to serve over HTTP at `/mcp` (stateless; `/healthz` for probes) |
+| `MCP_HOST` / `MCP_PORT` | `0.0.0.0` / `3000` | HTTP bind |
 | `REPO_CACHE_DIR` | `/cache` | repo cache (a PVC in-cluster) |
 | `GIT_BASE_URL` | _(required)_ | git host API + clone base, e.g. `https://git.example.com` |
 | `GIT_OWNERS` | _(required unless `REPO_ALLOWLIST` is set)_ | owners/orgs to enumerate, e.g. `example-org`; setting it together with `REPO_ALLOWLIST` is an error |
@@ -48,11 +48,11 @@ been cloned so far. Each refresh cycle also discovers and clones new repositorie
 docker build -t repo-mcp .      # or: podman build -t repo-mcp .
 
 uv sync --frozen               # Python 3.14 and uv
-MCP_TRANSPORT=sse REPO_CACHE_DIR=/tmp/cache GIT_TOKEN=... .venv/bin/python server.py
+MCP_TRANSPORT=streamable-http REPO_CACHE_DIR=/tmp/cache GIT_TOKEN=... .venv/bin/python server.py
 ```
 Tests: `uv sync --frozen --extra dev && .venv/bin/python -m pytest tests/` (needs `git`).
 
-The server reports its release in the MCP `initialize` result
+The server reports its release in its MCP server info
 (`serverInfo.version`). To stamp it, build from a checkout with tags:
 
 ```

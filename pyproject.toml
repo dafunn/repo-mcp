@@ -16,4 +16,5 @@ dependencies = [
 # Test dependencies.
 dev = [
     "pytest",
+    "httpx2",  # imported by the streamable HTTP tests
 ]

@@ -672,22 +672,29 @@ async def _bootstrap_then_loop() -> None:
     await refresh_loop()
 
 
-def build_sse_app():
-    """Build the Starlette ASGI app for the SSE transport. A separate function so tests
-    can construct it. Startup and shutdown use the ``lifespan`` context manager.
+def build_http_app():
+    """Build the Starlette ASGI app for the streamable HTTP transport, served at
+    `/mcp`. A separate function so tests can construct it. Startup and shutdown
+    use the ``lifespan`` context manager.
+
+    Stateless: each request is handled on its own, with no session to keep.
+    `/healthz` is the probe target; a GET on `/mcp` opens a stream that stays open.
     """
     from contextlib import asynccontextmanager
 
-    from mcp.server.sse import SseServerTransport
+    from mcp.server.streamable_http_manager import (
+        StreamableHTTPASGIApp,
+        StreamableHTTPSessionManager,
+    )
     from starlette.applications import Starlette
     from starlette.requests import Request
-    from starlette.routing import Mount, Route
+    from starlette.responses import PlainTextResponse
+    from starlette.routing import Route
 
-    sse = SseServerTransport("/messages/")
+    manager = StreamableHTTPSessionManager(app=_server, stateless=True)
 
-    async def handle_sse(request: Request) -> None:
-        async with sse.connect_sse(request.scope, request.receive, request._send) as (rs, ws):
-            await _server.run(rs, ws, _server.create_initialization_options())
+    async def health(_request: Request) -> PlainTextResponse:
+        return PlainTextResponse("ok")
 
     @asynccontextmanager
     async def lifespan(_app):
@@ -695,14 +702,15 @@ def build_sse_app():
         # clone; repo_list reflects what's cloned so far. Cancelled on shutdown.
         task = asyncio.create_task(_bootstrap_then_loop())
         try:
-            yield
+            async with manager.run():
+                yield
         finally:
             task.cancel()
 
     return Starlette(
         routes=[
-            Route("/sse", endpoint=handle_sse),
-            Mount("/messages/", app=sse.handle_post_message),
+            Route("/mcp", endpoint=StreamableHTTPASGIApp(manager)),
+            Route("/healthz", endpoint=health),
         ],
         lifespan=lifespan,
     )
@@ -710,14 +718,16 @@ def build_sse_app():
 
 if __name__ == "__main__":
     transport = os.getenv("MCP_TRANSPORT", "stdio")
-    if transport == "sse":
+    if transport == "streamable-http":
         import uvicorn
 
         uvicorn.run(
-            build_sse_app(),
+            build_http_app(),
             host=os.getenv("MCP_HOST", "0.0.0.0"),
             port=int(os.getenv("MCP_PORT", "3000")),
         )
+    elif transport != "stdio":
+        raise SystemExit(f"MCP_TRANSPORT must be 'stdio' or 'streamable-http', got {transport!r}")
     else:
         async def _run_stdio() -> None:
             from mcp.server.stdio import stdio_server

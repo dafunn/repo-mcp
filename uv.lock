@@ -567,12 +567,14 @@ dependencies = [
 
 [package.optional-dependencies]
 dev = [
+    { name = "httpx2" },
     { name = "pytest" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "httpx" },
+    { name = "httpx2", marker = "extra == 'dev'" },
     { name = "mcp", extras = ["cli"], specifier = ">=2,<3" },
     { name = "pytest", marker = "extra == 'dev'" },
     { name = "starlette" },
